@@ -262,32 +262,127 @@ def create_order(
 # --------------------------------
 # WHATSAPP WEBHOOK
 # --------------------------------
-@app.get("/webhook")
-def verify_whatsapp_webhook(
-    hub_mode: str = Query(None, alias="hub.mode"),
-    hub_verify_token: str = Query(None, alias="hub.verify_token"),
-    hub_challenge: str = Query(None, alias="hub.challenge")
-):
-
-    if (
-        hub_mode == "subscribe"
-        and hub_verify_token == WHATSAPP_VERIFY_TOKEN
-    ):
-        return int(hub_challenge)
-
-    return {
-        "success": False,
-        "message": "Webhook verification failed"
-    }
 @app.post("/webhook")
-async def whatsapp_webhook(request: Request):
-
+async def whatsapp_webhook(
+    request: Request,
+    db: Session = Depends(get_db)
+):
     data = await request.json()
 
-    print("\n========== WHATSAPP MESSAGE ==========")
-    print(data)
-    print("======================================\n")
+    message = data.get("message", "")
+    phone = data.get("from", "")
+
+    if not message:
+        return {
+            "success": False,
+            "message": "Message nahi mila."
+        }
+
+    items = parse_order(message, db)
+
+    if not items:
+        return {
+            "success": False,
+            "phone": phone,
+            "reply": "Sorry, mujhe menu item samajh nahi aaya. Please item ka naam dobara bhejein."
+        }
+
+    totals = calculate_order_total(items, 150)
+
+    item_lines = []
+
+    for item in items:
+        item_lines.append(
+            f"{item['quantity']} x {item['name']} = Rs. {item['total']}"
+        )
+
+    reply = (
+        "🍔 *Burger O'Clock Order*\n\n"
+        + "\n".join(item_lines)
+        + f"\n\nSubtotal: Rs. {totals['subtotal']}"
+        + f"\nDelivery: Rs. {totals['delivery_charges']}"
+        + f"\n*Total: Rs. {totals['total']}*"
+        + "\n\nKya aap order confirm karna chahte hain?"
+    )
 
     return {
-        "success": True
+        "success": True,
+        "phone": phone,
+        "items": items,
+        "subtotal": totals["subtotal"],
+        "delivery_charges": totals["delivery_charges"],
+        "total": totals["total"],
+        "reply": reply
+    }
+@app.post("/order/confirm")
+def confirm_order(
+    order_data: CreateOrderRequest,
+    db: Session = Depends(get_db)
+):
+    items = parse_order(order_data.message, db)
+
+    if not items:
+        return {
+            "success": False,
+            "message": "Menu item nahi mila."
+        }
+
+    totals = calculate_order_total(
+        items,
+        order_data.delivery_charges
+    )
+
+    customer = (
+        db.query(Customer)
+        .filter(Customer.phone == order_data.phone)
+        .first()
+    )
+
+    if not customer:
+        customer = Customer(
+            name=order_data.customer_name,
+            phone=order_data.phone,
+            address=order_data.delivery_address
+        )
+        db.add(customer)
+        db.commit()
+        db.refresh(customer)
+
+    new_order = Order(
+        customer_id=customer.id,
+        items=json.dumps(items),
+        subtotal=totals["subtotal"],
+        delivery_charges=totals["delivery_charges"],
+        total=totals["total"],
+        order_type=order_data.order_type,
+        payment_method=order_data.payment_method,
+        status="confirmed",
+        delivery_address=order_data.delivery_address
+    )
+
+    db.add(new_order)
+    db.commit()
+    db.refresh(new_order)
+
+    return {
+        "success": True,
+        "order_id": new_order.id,
+        "status": "confirmed",
+        "customer": {
+            "name": customer.name,
+            "phone": customer.phone,
+            "address": customer.address
+        },
+        "items": items,
+        "subtotal": totals["subtotal"],
+        "delivery_charges": totals["delivery_charges"],
+        "total": totals["total"],
+        "order_type": order_data.order_type,
+        "payment_method": order_data.payment_method,
+        "delivery_address": order_data.delivery_address,
+        "confirmation_message": (
+            f"Thank you {customer.name}! "
+            f"Your order #{new_order.id} is confirmed. "
+            f"Total amount is Rs. {totals['total']}."
+        )
     }
